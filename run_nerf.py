@@ -66,7 +66,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
       ndc: bool. If True, represent ray origin, direction in NDC coordinates.
       near: float or array of shape [batch_size]. Nearest distance for a ray.
       far: float or array of shape [batch_size]. Farthest distance for a ray.
-      use_viewdirs: bool. If True, use viewing direction of a point in space in model.
+      use_viewdirs: bool. If True, use viewing direction of a point in space in model. 是否向模型输入视角信息 
       c2w_staticcam: array of shape [3, 4]. If not None, use this transformation matrix for 
        camera while using other c2w argument for viewing directions.
     Returns:
@@ -84,12 +84,12 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
 
     if use_viewdirs:
         # provide ray directions as input
-        viewdirs = rays_d
+        viewdirs = rays_d # view directions 视角信息 就是 rays_d 的归一化 
         if c2w_staticcam is not None:
             # special case to visualize effect of viewdirs
             rays_o, rays_d = get_rays(H, W, K, c2w_staticcam)
         viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
-        viewdirs = torch.reshape(viewdirs, [-1,3]).float()
+        viewdirs = torch.reshape(viewdirs, [-1,3]).float() # (N_rays, 3)
 
     sh = rays_d.shape # [..., 3]
     if ndc:
@@ -98,11 +98,11 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
 
     # Create ray batch
     rays_o = torch.reshape(rays_o, [-1,3]).float()
-    rays_d = torch.reshape(rays_d, [-1,3]).float() # (N_rand, 3)
+    rays_d = torch.reshape(rays_d, [-1,3]).float() # (N_rays, 3)
 
     # 设置所有射线的采样范围均为[near, far] 
     near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1]) # (N_rand, 1) 
-    rays = torch.cat([rays_o, rays_d, near, far], -1) # (N_rand, 8) 
+    rays = torch.cat([rays_o, rays_d, near, far], -1) # (N_rays, 8) 
     if use_viewdirs:
         rays = torch.cat([rays, viewdirs], -1)
 
@@ -204,7 +204,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
     # r(t) = o + td 得到所有的点 一共有N_rays * N_samples个点 
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # (N_rays, N_samples, 3) 
 
-#     raw = run_network(pts)
+    # raw = run_network(pts)
     raw = network_query_fn(pts, viewdirs, network_fn)
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
@@ -239,6 +239,52 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
             print(f"! [Numerical Error] {k} contains nan or inf.")
 
     return ret
+
+
+def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
+    """Transforms model's predictions to semantically meaningful values.
+    Args:
+        raw: [num_rays, num_samples along ray, 4]. Prediction from model.
+        z_vals: [num_rays, num_samples along ray]. Integration time.
+        rays_d: [num_rays, 3]. Direction of each ray.
+    Returns:
+        rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
+        disp_map: [num_rays]. Disparity map. Inverse of depth map.
+        acc_map: [num_rays]. Sum of weights along each ray.
+        weights: [num_rays, num_samples]. Weights assigned to each sampled color.
+        depth_map: [num_rays]. Estimated distance to object.
+    """
+    raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
+
+    dists = z_vals[...,1:] - z_vals[...,:-1]
+    dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
+
+    dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
+
+    rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
+    noise = 0.
+    if raw_noise_std > 0.:
+        noise = torch.randn(raw[...,3].shape) * raw_noise_std
+
+        # Overwrite randomly sampled data if pytest
+        if pytest:
+            np.random.seed(0)
+            noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
+            noise = torch.Tensor(noise)
+
+    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
+    # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
+    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
+    rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
+
+    depth_map = torch.sum(weights * z_vals, -1)
+    disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
+    acc_map = torch.sum(weights, -1)
+
+    if white_bkgd:
+        rgb_map = rgb_map + (1.-acc_map[...,None])
+
+    return rgb_map, disp_map, acc_map, weights, depth_map
 
 
 def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
@@ -366,52 +412,6 @@ def create_nerf(args):
     return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
 
 
-def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
-    """Transforms model's predictions to semantically meaningful values.
-    Args:
-        raw: [num_rays, num_samples along ray, 4]. Prediction from model.
-        z_vals: [num_rays, num_samples along ray]. Integration time.
-        rays_d: [num_rays, 3]. Direction of each ray.
-    Returns:
-        rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
-        disp_map: [num_rays]. Disparity map. Inverse of depth map.
-        acc_map: [num_rays]. Sum of weights along each ray.
-        weights: [num_rays, num_samples]. Weights assigned to each sampled color.
-        depth_map: [num_rays]. Estimated distance to object.
-    """
-    raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
-
-    dists = z_vals[...,1:] - z_vals[...,:-1]
-    dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
-
-    dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
-
-    rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
-    noise = 0.
-    if raw_noise_std > 0.:
-        noise = torch.randn(raw[...,3].shape) * raw_noise_std
-
-        # Overwrite randomly sampled data if pytest
-        if pytest:
-            np.random.seed(0)
-            noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
-            noise = torch.Tensor(noise)
-
-    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
-    # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
-    rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
-
-    depth_map = torch.sum(weights * z_vals, -1)
-    disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
-    acc_map = torch.sum(weights, -1)
-
-    if white_bkgd:
-        rgb_map = rgb_map + (1.-acc_map[...,None])
-
-    return rgb_map, disp_map, acc_map, weights, depth_map
-
-
 def config_parser():
 
     import configargparse
@@ -462,9 +462,9 @@ def config_parser():
                         help='use full 5D input instead of 3D')
     parser.add_argument("--i_embed", type=int, default=0, 
                         help='set 0 for default positional encoding, -1 for none')
-    parser.add_argument("--multires", type=int, default=10, 
+    parser.add_argument("--multires", type=int, default=10, # 位置的位置编码的L 
                         help='log2 of max freq for positional encoding (3D location)')
-    parser.add_argument("--multires_views", type=int, default=4, 
+    parser.add_argument("--multires_views", type=int, default=4, # 视角的位置编码的L 
                         help='log2 of max freq for positional encoding (2D direction)')
     parser.add_argument("--raw_noise_std", type=float, default=0., 
                         help='std dev of noise added to regularize sigma_a output, 1e0 recommended')

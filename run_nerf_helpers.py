@@ -21,15 +21,15 @@ class Embedder:
         embed_fns = []
         d = self.kwargs['input_dims']
         out_dim = 0
-        if self.kwargs['include_input']:
+        if self.kwargs['include_input']: # 是否包含不经编码的原始输入 
             embed_fns.append(lambda x : x)
             out_dim += d
             
         max_freq = self.kwargs['max_freq_log2']
         N_freqs = self.kwargs['num_freqs']
         
-        if self.kwargs['log_sampling']:
-            freq_bands = 2.**torch.linspace(0., max_freq, steps=N_freqs)
+        if self.kwargs['log_sampling']: # 生成2^0, 2^1, ..., 2^{L-1} 共L个系数  
+            freq_bands = 2.**torch.linspace(0., max_freq, steps=N_freqs) 
         else:
             freq_bands = torch.linspace(2.**0., 2.**max_freq, steps=N_freqs)
             
@@ -37,7 +37,7 @@ class Embedder:
             for p_fn in self.kwargs['periodic_fns']:
                 embed_fns.append(lambda x, p_fn=p_fn, freq=freq : p_fn(x * freq))
                 out_dim += d
-                    
+        
         self.embed_fns = embed_fns
         self.out_dim = out_dim
         
@@ -66,8 +66,6 @@ def get_embedder(multires, i=0):
 # Model
 class NeRF(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
-        """ 
-        """
         super(NeRF, self).__init__()
         self.D = D
         self.W = W
@@ -77,9 +75,11 @@ class NeRF(nn.Module):
         self.use_viewdirs = use_viewdirs
         
         self.pts_linears = nn.ModuleList(
-            [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
+            [nn.Linear(input_ch, W)] + # 第一个Linear 把通道从63转成256 
+            [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
         
-        ### Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
+        ### Implementation according to the official code release 
+        # (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
         self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
 
         ### Implementation according to the paper
@@ -88,8 +88,8 @@ class NeRF(nn.Module):
         
         if use_viewdirs:
             self.feature_linear = nn.Linear(W, W)
-            self.alpha_linear = nn.Linear(W, 1)
-            self.rgb_linear = nn.Linear(W//2, 3)
+            self.alpha_linear = nn.Linear(W, 1) # 产生密度的 
+            self.rgb_linear = nn.Linear(W//2, 3) # 产生颜色的 
         else:
             self.output_linear = nn.Linear(W, output_ch)
 
@@ -146,7 +146,6 @@ class NeRF(nn.Module):
         idx_alpha_linear = 2 * self.D + 6
         self.alpha_linear.weight.data = torch.from_numpy(np.transpose(weights[idx_alpha_linear]))
         self.alpha_linear.bias.data = torch.from_numpy(np.transpose(weights[idx_alpha_linear+1]))
-
 
 
 # Ray helpers
