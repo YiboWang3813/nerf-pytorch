@@ -151,14 +151,38 @@ class NeRF(nn.Module):
 
 # Ray helpers
 def get_rays(H, W, K, c2w):
-    i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H))  # pytorch's meshgrid has indexing='ij'
+    """ 得到一张图像中所有像素对应在世界坐标系下的光线 
+    Args:
+        H: 图像高度 
+        W: 图像宽度
+        K: 相机内参矩阵 
+        c2w: 相机位姿矩阵即相机外参矩阵的逆矩阵 
+    Returns:
+        rays_o: 所有光线的源点坐标
+        rays_d: 所有光线的方向向量 """ 
+    # 得到在像素平面坐标系下按uv方向排列的每个像素的横坐标和纵坐标 
+    # 其中i保留了每个像素的u坐标 j保留了每个像素的v坐标 
+    # 也可以通过以下这段代码来得到 
+    # u = torch.linspace(0, W-1, W).repeat(H, 1) 
+    # v = torch.linspace(0, H-1, H).reshape(H, 1).repeat(1, W) 
+    i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H)) # pytorch's meshgrid has indexing='ij'
     i = i.t()
     j = j.t()
-    dirs = torch.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -torch.ones_like(i)], -1)
+
+    # 将点从像素平面坐标系uv系转化到归一化的相机坐标系xcyczc系
+    # 其中K[0][2]是c_x K[1][2]是c_y K[0][0]是f_x K[1][1]是f_y 
+    # TODO 这里不明白为什么他给纵坐标加了负号 横坐标不变 难道不应该是反过来的吗 
+    dirs = torch.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -torch.ones_like(i)], -1) # (H, W, 3) 
+
     # Rotate ray directions from camera frame to the world frame
-    rays_d = torch.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
+    # 将点从相机坐标系xcyczc系转化到世界坐标系xwywzw系 
+    # 一个像素点也就是一个像素坐标对应一条射线方向 
+    # 这里的代码操作实现的效果等同于c2w旋转矩阵R_c左乘点列向量P 
+    rays_d = torch.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1) # (H, W, 3) 
+    
     # Translate camera frame's origin to the world frame. It is the origin of all rays.
-    rays_o = c2w[:3,-1].expand(rays_d.shape)
+    # 给所有点(射线)安排一个相机在世界坐标系下的原点 
+    rays_o = c2w[:3,-1].expand(rays_d.shape) # (H, W, 3)
     return rays_o, rays_d
 
 
