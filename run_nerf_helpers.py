@@ -217,18 +217,28 @@ def ndc_rays(H, W, focal, near, rays_o, rays_d):
 
 # Hierarchical sampling (section 5.2)
 def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
-    # Get pdf
+    """ 
+    根据权重进行二次采样 
+    Args:
+        bins: (N_rays, N_samples - 1) 
+        weights: (N_rays, N_samples - 2) 
+        N_samples: 要精细采样的点数 
+
+    Returns:
+        samples: (N_rays, N_samples) 精细采样的点坐标 
+    """
+    # Get pdf 利用softmax函数将权重转换为概率分布 
     weights = weights + 1e-5 # prevent nans
-    pdf = weights / torch.sum(weights, -1, keepdim=True)
+    pdf = weights / torch.sum(weights, -1, keepdim=True) # (N_rays, N_samples - 2)
     cdf = torch.cumsum(pdf, -1)
-    cdf = torch.cat([torch.zeros_like(cdf[...,:1]), cdf], -1)  # (batch, len(bins))
+    cdf = torch.cat([torch.zeros_like(cdf[...,:1]), cdf], -1) # (batch, len(bins)) (N_rays, N_samples-1)
 
     # Take uniform samples
     if det:
         u = torch.linspace(0., 1., steps=N_samples)
         u = u.expand(list(cdf.shape[:-1]) + [N_samples])
     else:
-        u = torch.rand(list(cdf.shape[:-1]) + [N_samples])
+        u = torch.rand(list(cdf.shape[:-1]) + [N_samples]) # (N_rays, 2) 
 
     # Pytest, overwrite u with numpy's fixed random numbers
     if pytest:

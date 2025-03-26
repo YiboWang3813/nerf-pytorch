@@ -208,19 +208,19 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
     raw = network_query_fn(pts, viewdirs, network_fn)
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
-    if N_importance > 0:
+    if N_importance > 0: # 进行精细采样 
 
         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
 
-        z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+        z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1]) # (N_rays, N_samples-1) 
         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
-        z_samples = z_samples.detach()
+        z_samples = z_samples.detach() # 得到更精细采样的点坐标 
 
-        z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
-        pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
+        z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1) # 组合均匀采样和精细采样的点坐标 
+        pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3] (1024, 192, 3)
 
         run_fn = network_fn if network_fine is None else network_fine
-#         raw = run_network(pts, fn=run_fn)
+        # raw = run_network(pts, fn=run_fn)
         raw = network_query_fn(pts, viewdirs, run_fn)
 
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
@@ -244,7 +244,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
     """Transforms model's predictions to semantically meaningful values.
     Args:
-        raw: [num_rays, num_samples along ray, 4]. Prediction from model.
+        raw: [num_rays, num_samples along ray, 4]. Prediction from model. 模型的输出 [4] = [rgb, sigma]
         z_vals: [num_rays, num_samples along ray]. Integration time.
         rays_d: [num_rays, 3]. Direction of each ray.
     Returns:
@@ -254,14 +254,16 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
         depth_map: [num_rays]. Estimated distance to object.
     """
-    raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
-
-    dists = z_vals[...,1:] - z_vals[...,:-1]
-    dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
+    # 计算\delta_n 他就是每个采样点的间隔 间隔数等于采样点数减一 
+    dists = z_vals[...,1:] - z_vals[...,:-1] # (N_rays, N_samples-1) 
+    dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # (N_rays, N_samples)
 
     dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
 
+    # 获得模型对每个点的颜色的预测值 
     rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
+    
+    # 选择性添加噪声 
     noise = 0.
     if raw_noise_std > 0.:
         noise = torch.randn(raw[...,3].shape) * raw_noise_std
@@ -272,14 +274,22 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
             noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
             noise = torch.Tensor(noise)
 
-    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
+    # 计算alpha 
+    # raw2alpha就是公式 \alpha_n = 1 - e^{-\sigma_n \delta_n} 
+    # 添加relu激活函数的原因是密度必须大于等于0 
+    raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
+    alpha = raw2alpha(raw[...,3] + noise, dists) # (N_rays, N_samples) 
+
+    # 计算飞书上公式11的权重 就是除了C_n的一堆和alpha有关的 
+    # 这里N_samples轴就是公式里的n 
+    # weights计算中左拼一个1是为了给累乘一个初始值 不要最后一个数是为了满足n-1 
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
-    rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
+    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1] # (N_rays, N_samples) 
+    rgb_map = torch.sum(weights[...,None] * rgb, -2) # (N_rays, 3) 
 
     depth_map = torch.sum(weights * z_vals, -1)
     disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
-    acc_map = torch.sum(weights, -1)
+    acc_map = torch.sum(weights, -1) # (N_rays,) 
 
     if white_bkgd:
         rgb_map = rgb_map + (1.-acc_map[...,None])
@@ -320,7 +330,6 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
             rgb8 = to8b(rgbs[-1])
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
             imageio.imwrite(filename, rgb8)
-
 
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
